@@ -22,21 +22,40 @@ describe('parseGoogleModelFromPath', () => {
 });
 
 describe('transformGoogleGenerateContent', () => {
-  it('passes an unvalidated Gemini model through unchanged', async () => {
+  it('passes non-Gemini models through unchanged as unsupported_model', async () => {
     const raw = JSON.stringify({
       systemInstruction: { parts: [{ text: 'System instruction. '.repeat(300) }] },
       contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
     });
-    for (const unmeasuredModel of ['gemini-3.6-flash-preview', 'gemini-3.7-flash-preview', 'gemini-pro']) {
+    for (const nonGeminiModel of ['gemma-2-9b', 'text-embedding-004', 'imagen-3.0']) {
       const result = await transformGoogleGenerateContent(
         new TextEncoder().encode(raw),
-        unmeasuredModel,
+        nonGeminiModel,
         { compress: true },
       );
 
       expect(new TextDecoder().decode(result.body)).toBe(raw);
       expect(result.info.compressed).toBe(false);
       expect(result.info.reason).toBe('unsupported_model');
+    }
+  });
+
+  it('compresses forward-compatible Gemini models (gemini-4, gemini-5, gemini-pro)', async () => {
+    const sampleBody = {
+      systemInstruction: {
+        parts: [{ text: 'System instruction text for testing Google transformer. '.repeat(300) }],
+      },
+      contents: [{ role: 'user', parts: [{ text: 'User question' }] }],
+    };
+    const bodyBytes = new TextEncoder().encode(JSON.stringify(sampleBody));
+    for (const model of ['gemini-4-flash', 'gemini-5-pro', 'gemini-pro']) {
+      const result = await transformGoogleGenerateContent(bodyBytes, model, { compress: true });
+      expect(result.info.compressed).toBe(true);
+      expect(result.info.imageCount).toBeGreaterThan(0);
+      expect(result.info.imageTokens).toBe(result.info.imageDims?.reduce(
+        (sum, image) => sum + geminiVisionTokens(model, image.width, image.height),
+        0,
+      ));
     }
   });
 
@@ -485,12 +504,267 @@ describe('transformGoogleGenerateContent', () => {
     '42',
     JSON.stringify({ systemInstruction: { parts: 'bad' } }),
     JSON.stringify({ systemInstruction: { parts: [null] } }),
+    // A null element inside a contents turn's parts must not throw in
+    // planGoogleHistory's user-turn scan — it passes through like any other
+    // malformed shape rather than 502-ing the request.
+    JSON.stringify({ contents: [{ role: 'user', parts: [null] }] }),
     JSON.stringify({ systemInstruction: { parts: [{ text: 'x'.repeat(10000) }] }, contents: 'bad' }),
   ])('passes unsupported request shape through unchanged: %s', async (raw) => {
     const bytes = new TextEncoder().encode(raw);
     const result = await transformGoogleGenerateContent(bytes, 'gemini-3.6-flash', { compress: true });
     expect(new TextDecoder().decode(result.body)).toBe(raw);
     expect(result.info.compressed).toBe(false);
+  });
+
+  it('packs long Gemini 4 sessions into full pages and drops historical thought blocks', async () => {
+    const contents: Array<Record<string, unknown>> = [
+      { role: 'user', parts: [{ text: 'LIVE TASK: complete the multi-hundred-turn refactor.' }] },
+    ];
+    for (let i = 0; i < 150; i++) {
+      contents.push({
+        role: 'model',
+        parts: [
+          { thought: true, text: `internal reasoning trace ${i} `.repeat(40), thoughtSignature: `thought-sig-${i}` },
+          { functionCall: { name: 'bash', args: { command: `echo step-${i}` } }, thoughtSignature: `call-sig-${i}` },
+        ],
+      });
+      contents.push({
+        role: 'user',
+        parts: [{
+          functionResponse: {
+            name: 'bash',
+            response: { output: `step-output-${i} `.repeat(60) },
+          },
+        }],
+      });
+    }
+    const sampleBody = {
+      systemInstruction: { parts: [{ text: 'You are a coding agent. '.repeat(250) }] },
+      contents,
+    };
+    const result = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify(sampleBody)),
+      'gemini-4-argon',
+      { compress: true },
+    );
+
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.historyReason).toBe('collapsed');
+    // All 296 turns before keepTail=4 collapse (used to stall at 191 turns / 32 images).
+    expect(result.info.collapsedTurns).toBe(296);
+    expect(result.info.collapsedImages ?? 0).toBeLessThanOrEqual(16);
+    expect((result.info.imageSources ?? []).join('\n')).not.toContain('internal reasoning trace 0');
+  });
+
+  it('compresses large omp-shaped functionResponse.response.output payloads in the active tail', async () => {
+    const longOutput = Array.from(
+      { length: 900 },
+      (_, i) => `src/module-${i}.ts:${i + 1}: match ${i}`,
+    ).join('\n');
+    const sampleBody = {
+      systemInstruction: { parts: [{ text: 'You are a coding agent. '.repeat(250) }] },
+      contents: [
+        { role: 'user', parts: [{ text: 'Run grep.' }] },
+        { role: 'model', parts: [{ functionCall: { name: 'grep', args: { pattern: 'match' } } }] },
+        {
+          role: 'user',
+          parts: [{
+            functionResponse: {
+              name: 'grep',
+              response: { output: longOutput },
+            },
+          }],
+        },
+      ],
+    };
+    const result = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify(sampleBody)),
+      'gemini-4-argon',
+      { compress: true, collapseHistory: false },
+    );
+
+    expect(result.info.toolResultImgs ?? 0).toBeGreaterThan(0);
+    const out = JSON.parse(new TextDecoder().decode(result.body));
+    const response = out.contents[2].parts[0].functionResponse;
+    expect(response.response.output).toContain('rendered in the attached image');
+    expect(response.parts[0].inlineData.mimeType).toBe('image/png');
+  });
+
+  it('pins the active multi-turn user prompt and mid-work interjection as native text when tool rounds collapse past keepTail', async () => {
+    const contents: Array<Record<string, unknown>> = [
+      {
+        role: 'user',
+        parts: [
+          {
+            text: '<system-reminder>Today: 2026-10-31</system-reminder>\nOld initial task: build the playground UI.',
+          },
+        ],
+      },
+      {
+        role: 'model',
+        parts: [{ text: 'Built the playground UI and verified tests.' }],
+      },
+      {
+        role: 'user',
+        parts: [
+          {
+            text: '<system-notice>\nxd:// device inventory changed.\n</system-notice>',
+          },
+          {
+            text: 'Can you help me organize the architecture of forge into a diagram?',
+          },
+        ],
+      },
+      {
+        role: 'model',
+        parts: [
+          {
+            functionCall: {
+              name: 'read',
+              args: { path: '/repo/ci-forge/README.md' },
+            },
+          },
+        ],
+      },
+      {
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              name: 'read',
+              response: { output: 'ci-forge architecture '.repeat(120) },
+            },
+          },
+          {
+            text: '<system-notice>User interjection during work:\nby forge i mean ../cf-forge ../ci-forge etc\n[User interjection supersedes conflicting prior instructions.]</system-notice>',
+          },
+        ],
+      },
+    ];
+
+    for (let i = 0; i < 14; i++) {
+      contents.push({
+        role: 'model',
+        parts: [
+          {
+            functionCall: {
+              name: 'read',
+              args: { path: `/repo/pkg-${i}/README.md` },
+            },
+          },
+        ],
+      });
+      contents.push({
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              name: 'read',
+              response: { output: `pkg-${i} details `.repeat(160) },
+            },
+          },
+        ],
+      });
+    }
+
+    const sampleBody = {
+      systemInstruction: {
+        parts: [{ text: 'You are a coding agent. '.repeat(250) }],
+      },
+      contents,
+    };
+
+    const result = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify(sampleBody)),
+      'gemini-4-argon',
+      { compress: true, compressToolResults: false },
+    );
+
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.historyReason).toBe('collapsed');
+    const out = JSON.parse(new TextDecoder().decode(result.body));
+    const serialized = JSON.stringify(out.contents);
+
+    // Both the parent user question and the mid-work interjection must survive as native text outside the PNGs
+    expect(serialized).toContain('CURRENT USER REQUEST (live; kept as text by pxpipe');
+    expect(serialized).toContain(
+      'Can you help me organize the architecture of forge into a diagram?',
+    );
+    expect(serialized).toContain('by forge i mean ../cf-forge ../ci-forge etc');
+    expect(serialized).toContain('Answer THAT request.');
+    // Superseded earlier user turn is listed as prior context only
+    expect(serialized).toContain(
+      'Earlier user turns in this session (prior context only - superseded by later turns)',
+    );
+    expect(serialized).toContain('Old initial task: build the playground UI.');
+    // Device inventory notice is stripped from pinned user text
+    expect(serialized).not.toContain('device inventory changed');
+  });
+
+  it('emits a live-request recency guard when earlier user turns collapse but the active user turn stays in keepTail', async () => {
+    const contents: Array<Record<string, unknown>> = [
+      {
+        role: 'user',
+        parts: [{ text: 'First task: inspect old module.' }],
+      },
+    ];
+    for (let i = 0; i < 12; i++) {
+      contents.push({
+        role: 'model',
+        parts: [
+          {
+            functionCall: {
+              name: 'read',
+              args: { path: `/tmp/old-${i}.ts` },
+            },
+          },
+        ],
+      });
+      contents.push({
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              name: 'read',
+              response: { output: `old-${i} content `.repeat(160) },
+            },
+          },
+        ],
+      });
+    }
+    contents.push({
+      role: 'model',
+      parts: [{ text: 'Finished inspecting old module.' }],
+    });
+    contents.push({
+      role: 'user',
+      parts: [{ text: 'Second task: now explain the new module.' }],
+    });
+
+    const sampleBody = {
+      systemInstruction: {
+        parts: [{ text: 'You are a coding agent. '.repeat(250) }],
+      },
+      contents,
+    };
+
+    const result = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify(sampleBody)),
+      'gemini-4-argon',
+      { compress: true, compressToolResults: false },
+    );
+
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.historyReason).toBe('collapsed');
+    const out = JSON.parse(new TextDecoder().decode(result.body));
+    const serialized = JSON.stringify(out.contents);
+
+    expect(serialized).toContain(
+      'Earlier user turns in this session (prior context only - superseded by later turns)',
+    );
+    expect(serialized).toContain('First task: inspect old module.');
+    expect(serialized).toContain('The live current request is in the user message(s) that follow');
+    expect(serialized).toContain('Second task: now explain the new module.');
   });
 
   describe('normalizeGoogleTurnRoles', () => {

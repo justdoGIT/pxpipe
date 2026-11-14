@@ -64,7 +64,7 @@ async function readAnthropicStream(response) {
   return { text: text.trim(), usage };
 }
 
-export function responseBody(model, content, maxOutputTokens) {
+export function responseBody(model, content, maxOutputTokens, reasoningEffort = 'none') {
   const body = {
     model,
     stream: false,
@@ -72,13 +72,24 @@ export function responseBody(model, content, maxOutputTokens) {
     input: [{ role: 'user', content }],
   };
   if (!/^grok-/.test(model)) {
-    body.reasoning = { effort: 'none' };
+    body.reasoning = { effort: reasoningEffort };
   }
   body.text = { verbosity: 'low' };
   return body;
 }
 
-export async function callResponses({ model, content, maxOutputTokens, timeoutMs }) {
+export async function callResponses({ model, content, maxOutputTokens, timeoutMs, reasoningEffort = 'none' }) {
+  if (/^claude-/i.test(model || '')) {
+    // Max-subscription tty harness (eval/lib/anthropic-client.mjs); no API key.
+    const { createClient } = await import('../lib/anthropic-client.mjs');
+    const started = Date.now();
+    const res = await createClient({ model }).messages({
+      messages: [{ role: 'user', content: anthropicContent(content) }],
+      max_tokens: maxOutputTokens,
+    });
+    const text = (res.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n');
+    return { text: text.trim(), usage: res.usage || null, ms: Date.now() - started };
+  }
   if (isKimi(model)) {
     const key = process.env.KIMI_QUALITY_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
     if (!key) throw new Error('KIMI_QUALITY_API_KEY or ANTHROPIC_AUTH_TOKEN is required');
@@ -139,7 +150,7 @@ export async function callResponses({ model, content, maxOutputTokens, timeoutMs
         'content-type': 'application/json',
         authorization: `Bearer ${key}`,
       },
-      body: JSON.stringify(responseBody(model, content, maxOutputTokens)),
+      body: JSON.stringify(responseBody(model, content, maxOutputTokens, reasoningEffort)),
       signal: controller.signal,
     });
     const raw = await response.text();

@@ -11,7 +11,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { DashboardState, dashboardPath, dashboardHostLabel } from '../src/dashboard.js';
-import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicability.js';
+import { getAllowedModelBases, isPxpipeSupportedModel, setAllowedModelBases } from '../src/core/applicability.js';
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
@@ -192,9 +192,12 @@ describe('serveFragment', () => {
       expect(off).not.toContain('<div class="models" style="display:none">');
       // PXPIPE_MODELS textbox mirrors the live scope as CSV.
       expect(off).toContain('name="list"');
-      expect(off).toContain('value="claude-fable-5,gemini-3.6-flash,gemini-3.7-flash"');
+      expect(off).toContain('value="claude-fable-5,claude-opus-5-5,gemini"');
       expect(off).toContain('GPT 5.6 Sol</button>');
       expect(off).toContain('GPT 5.5</button>');
+      // Family chip is lit by default; per-version chips exist for narrowing.
+      expect(off).toContain('Gemini (all versions) ✓</button>');
+      expect(off).toContain('Gemini 3.8 Flash</button>');
       // Sol remains available and ordered before GPT 5.5.
       expect(off.indexOf('GPT 5.6 Sol')).toBeLessThan(off.indexOf('GPT 5.5'));
       expect(getAllowedModelBases()).toContain('claude-fable-5');
@@ -210,7 +213,14 @@ describe('serveFragment', () => {
       expect(getAllowedModelBases()).toContain('gpt-5.5');
       expect(getAllowedModelBases()).toContain('gpt-5.6-sol');
       // Chip flips are reflected back into the textbox CSV.
-      expect(onBoth).toContain('value="claude-fable-5,gemini-3.6-flash,gemini-3.7-flash,gpt-5.6-sol,gpt-5.5"');
+      expect(onBoth).toContain('value="claude-fable-5,claude-opus-5-5,gemini,gpt-5.6-sol,gpt-5.5"');
+      // Opting the Gemini family off is a real opt-out: the chip unlights and
+      // the base leaves the scope.
+      dash.handleModelsToggle('gemini', false);
+      const geminiOff = await (await dash.serveFragment('models', url, 1234)).text();
+      expect(geminiOff).toContain('Gemini (all versions)</button>');
+      expect(getAllowedModelBases()).not.toContain('gemini');
+      expect(isPxpipeSupportedModel('gemini-4')).toBe(false);
     } finally {
       setAllowedModelBases(null);
       if (prev === undefined) delete process.env.PXPIPE_MODELS;
@@ -250,7 +260,7 @@ describe('serveFragment', () => {
       });
 
       persisting.handleModelsToggle('gpt-5.6-sol', true);
-      expect(saved.at(-1)).toEqual(['claude-fable-5', 'gemini-3.6-flash', 'gemini-3.7-flash', 'gpt-5.6-sol']);
+      expect(saved.at(-1)).toEqual(['claude-fable-5', 'claude-opus-5-5', 'gemini', 'gpt-5.6-sol']);
       persisting.handleModelsSet('claude-fable-5');
       expect(saved.at(-1)).toEqual(['claude-fable-5']);
       // Empty scope persists too (round-trips as 'off' on load).
@@ -316,8 +326,9 @@ describe('serveFragment', () => {
     expect(html).toContain('Original Responses composition');
     expect(html).toContain('Reasoning / encrypted items');
     expect(html).toContain('Native tool JSON');
-    expect(html).toContain('Function outputs eligible in old closed pairs');
-    expect(html).toContain('Function outputs actually imaged this request');
+    expect(html).toContain('Tool calls (function + custom)');
+    expect(html).toContain('Tool outputs eligible in old closed pairs');
+    expect(html).toContain('Tool outputs actually imaged this request');
     expect(html).toContain('Completed tool pairs');
     expect(html).toContain('Open calls kept native');
     expect(html).toContain('56.0k tok');
@@ -674,7 +685,7 @@ describe('GPT savings split', () => {
 
 describe('Gemini savings split', () => {
   beforeEach(() => {
-    setAllowedModelBases(['gemini-3.6-flash']);
+    setAllowedModelBases(['gemini']);
   });
 
   it('shows measured token savings without applying Claude dollar pricing', async () => {
@@ -810,12 +821,35 @@ describe('Gemini savings split', () => {
     expect(recent.recent.at(-1)?.actual_input).toBe(1200);
     expect(recent.recent.at(-1)?.session_saved_so_far_delta).toBe(2900);
   });
+
+  it('counts forward-compatible Gemini models in enabled totals without warming-up zero counts', async () => {
+    dash.update({
+      method: 'POST',
+      path: '/google-ai-studio/v1beta/models/gemini-3.8-flash:generateContent',
+      model: 'gemini-3.8-flash',
+      accountingProvider: 'google',
+      status: 200,
+      durationMs: 100,
+      usage: { input_tokens: 150, output_tokens: 20 },
+      info: {
+        compressed: true,
+        baselineTokens: 500,
+        baselineProbeStatus: 'ok',
+        imageCount: 1,
+      },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.compressed_requests).toBe(1);
+    expect(stats.saved_input_tokens).toBe(350);
+  });
 });
 
-describe('server-observed warmth: text follows actual cache_read', () => {
-  // The text counterfactual is hypothetical, so its cache state follows the only
-  // server-observed signal we have: cr>0 means warm for both paths, cr===0 means
-  // cold for both paths. A prior row only refines reused/grown split after cr>0.
+describe('baseline warmth: cache_read or a fresh same-prefix prior', () => {
+  // The text path is warm when the actual request read cache (cr>0), or when a
+  // same-session prior with the same system + tools hash completed inside the
+  // TTL. The second case covers pxpipe busting its own image cache: the text
+  // request would still have hit its prefix, so that miss is pxpipe's cost.
   function antEvt(
     usage: {
       input_tokens: number;
@@ -826,12 +860,15 @@ describe('server-observed warmth: text follows actual cache_read', () => {
     cacheable: number,
     sid = 'warmsess',
     systemSha8 = 'stable-system',
+    toolsSha8?: string,
+    pxPrefixSha8?: string,
+    model = 'claude-opus-4',
   ): unknown {
     return {
       ts: '2026-05-19T00:00:00Z',
       method: 'POST',
       path: '/v1/messages',
-      model: 'claude-opus-4',
+      model,
       status: 200,
       duration_ms: 100,
       usage,
@@ -839,6 +876,8 @@ describe('server-observed warmth: text follows actual cache_read', () => {
         compressed: true,
         firstUserSha8: sid,
         systemSha8,
+        cachePrefixToolsSha8: toolsSha8,
+        cachePrefixSha8: pxPrefixSha8,
         baselineProbeStatus: 'ok',
         baselineTokens: 30000, // text counterfactual: full prefix + tail
         baselineCacheableTokens: cacheable, // prefix up to the cache_control marker
@@ -846,9 +885,8 @@ describe('server-observed warmth: text follows actual cache_read', () => {
     };
   }
 
-  it('prices text cold when the actual image request has cache_read=0', async () => {
-    // Turn 1 records a prior prefix size, but it must not make a later cr=0 row
-    // warm by wall-clock inference alone.
+  it('prices text warm when the image path missed but a fresh same-prefix prior exists', async () => {
+    // Turn 1 completes with the same system hash; turn 2 starts inside the TTL.
     dash.update(
       antEvt(
         {
@@ -858,11 +896,15 @@ describe('server-observed warmth: text follows actual cache_read', () => {
           cache_read_input_tokens: 20000, // warm read
         },
         20000,
+        'warmsess',
+        'stable-system',
+        undefined,
+        'px-a',
       ) as never,
     );
 
-    // Turn 2: actual request has cache_read === 0 and pays a full re-create.
-    // The imagined text path gets the same cold cache state.
+    // Turn 2: the image request misses (cache_read === 0) and pays a full
+    // re-create. The text request would have read its unchanged prefix.
     dash.update(
       antEvt(
         {
@@ -872,6 +914,10 @@ describe('server-observed warmth: text follows actual cache_read', () => {
           cache_read_input_tokens: 0, // ← the image-cache miss
         },
         20000,
+        'warmsess',
+        'stable-system',
+        undefined,
+        'px-b', // pxpipe sent a different image prefix → its own bust
       ) as never,
     );
 
@@ -884,9 +930,129 @@ describe('server-observed warmth: text follows actual cache_read', () => {
     // actual = 100 + 20000×1.25 = 25100 (what pxpipe actually paid this turn).
     expect(miss.actual_input).toBe(25100);
 
-    // Cold text baseline: 20000×1.25 + 10000 tail = 35000.
+    // Warm text baseline: 20000×0.1 reused + 10000 tail = 12000. The re-create
+    // is charged to pxpipe instead of being booked as savings.
+    expect(miss.baseline_input).toBe(12000);
+    expect(miss.session_saved_so_far_delta).toBe(-13100);
+  });
+
+  it('keeps text cold on cache_read=0 when pxpipe re-sent the same prefix (server eviction)', async () => {
+    const usageWarm = {
+      input_tokens: 100,
+      output_tokens: 50,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 20000,
+    };
+    const usageMiss = {
+      input_tokens: 100,
+      output_tokens: 50,
+      cache_creation_input_tokens: 20000,
+      cache_read_input_tokens: 0,
+    };
+    dash.update(antEvt(usageWarm, 20000, 'evict', 'stable-system', undefined, 'px-a') as never);
+    dash.update(antEvt(usageMiss, 20000, 'evict', 'stable-system', undefined, 'px-a') as never);
+
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const miss = recent.recent.at(-1)!;
+    // Same bytes went out and still missed: text would have missed too.
     expect(miss.baseline_input).toBe(35000);
     expect(miss.session_saved_so_far_delta).toBe(9900);
+  });
+
+  it('keeps text cold on cache_read=0 across a model switch (cache is per model)', async () => {
+    const usageWarm = {
+      input_tokens: 100,
+      output_tokens: 50,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 20000,
+    };
+    const usageMiss = {
+      input_tokens: 100,
+      output_tokens: 50,
+      cache_creation_input_tokens: 20000,
+      cache_read_input_tokens: 0,
+    };
+    dash.update(antEvt(usageWarm, 20000, 'modelsw', 'stable-system', undefined, 'px-a', 'claude-opus-4') as never);
+    dash.update(antEvt(usageMiss, 20000, 'modelsw', 'stable-system', undefined, 'px-b', 'claude-sonnet-4') as never);
+
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const miss = recent.recent.at(-1)!;
+    expect(miss.baseline_input).toBe(35000);
+  });
+
+  it('keeps text cold on cache_read=0 when the tools hash changed', async () => {
+    const usageWarm = {
+      input_tokens: 100,
+      output_tokens: 50,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 20000,
+    };
+    const usageMiss = {
+      input_tokens: 100,
+      output_tokens: 50,
+      cache_creation_input_tokens: 20000,
+      cache_read_input_tokens: 0,
+    };
+    dash.update(antEvt(usageWarm, 20000, 'toolsess', 'stable-system', 'tools-a') as never);
+    dash.update(antEvt(usageMiss, 20000, 'toolsess', 'stable-system', 'tools-b') as never);
+
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const miss = recent.recent.at(-1)!;
+    // A tool change re-keys the prefix for text too: 20000×1.25 + 10000 = 35000.
+    expect(miss.baseline_input).toBe(35000);
+    expect(miss.session_saved_so_far_delta).toBe(9900);
+  });
+
+  it('replays the L3-T0 row-35 golden: an image miss after a fresh prior is not savings', async () => {
+    // Rows 40-41 of a real 0.15.0 warp log (threads off). Row 41 re-created the
+    // whole image prefix (cr=0) 0.8 s after row 40 completed with the same
+    // system and tools hash. 0.15.0 priced its text path cold: +228,633 saved.
+    writeEvents(tmp, [
+      ev({
+        ts: '2026-10-19T05:51:53.466Z',
+        duration_ms: 4248,
+        compressed: true,
+        model: 'claude-opus-5-5',
+        cache_prefix_sha8: '4e4c9ca6',
+        first_user_sha8: 'c4fa7142',
+        system_sha8: '8d36a7a6',
+        cache_prefix_tools_sha8: '80a31dc9',
+        baseline_probe_status: 'ok',
+        baseline_tokens: 231849,
+        baseline_cacheable_tokens: 231849,
+        input_tokens: 2,
+        output_tokens: 172,
+        cache_create_tokens: 401,
+        cache_read_tokens: 68024,
+      }),
+      ev({
+        ts: '2026-10-19T05:52:01.803Z',
+        duration_ms: 7502,
+        compressed: true,
+        model: 'claude-opus-5-5',
+        cache_prefix_sha8: '58d9b560', // real log: pxpipe changed its prefix
+        first_user_sha8: 'c4fa7142',
+        system_sha8: '8d36a7a6',
+        cache_prefix_tools_sha8: '80a31dc9',
+        baseline_probe_status: 'ok',
+        baseline_tokens: 234521,
+        baseline_cacheable_tokens: 234521,
+        input_tokens: 2,
+        output_tokens: 193,
+        cache_create_tokens: 51613,
+        cache_read_tokens: 0,
+      }),
+    ]);
+    await dash.replay(tmp.eventsFile);
+
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const row = recent.recent.at(-1)!;
+    // actual = 2 + 51613×1.25 = 64518.25
+    // text   = 231849×0.1 reused + 2672×1.25 grown = 26524.9
+    // Row fields are round1()'d, so -37993.35 shows as 26524.9 - 64518.3.
+    expect(row.actual_input).toBe(64518.3);
+    expect(row.baseline_input).toBe(26524.9);
+    expect(row.baseline_input! - row.actual_input!).toBeCloseTo(-37993.4, 1);
   });
 
   it('does not let an overlapping request warm the text counterfactual before it completed', async () => {

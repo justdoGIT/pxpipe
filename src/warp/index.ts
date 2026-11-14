@@ -15,13 +15,13 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { accessSync, constants, existsSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { CertificateAuthority } from './ca.js';
 import { createWarpHandlers } from './connect.js';
+import { isRunnable } from './resolve.js';
 import { parseRoute, routeDestination, type Route } from './route.js';
 
 export interface WarpRuntimeOptions {
@@ -46,7 +46,15 @@ export interface WarpRuntime {
  * keeps the agent's client-side gates satisfied.
  */
 function defaultRoutes(port: number): Route[] {
-  return [parseRoute(`api.anthropic.com/v1/messages*=http://127.0.0.1:${port}`)];
+  return [
+    parseRoute(`api.anthropic.com/v1/messages*=http://127.0.0.1:${port}`),
+    parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:generateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:generateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`generativelanguage.googleapis.com/v1/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`generativelanguage.googleapis.com/v1/models/*:generateContent*=http://127.0.0.1:${port}`),
+  ];
 }
 
 export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
@@ -77,8 +85,8 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   // The kernel picks it, nothing else needs to know it, so there is nothing to
   // collide with a pxpipe already running.
   const proxy = createServer(handlers.handleAbsoluteForm);
+  proxy.on('connection', (socket) => socket.setNoDelay(true));
   proxy.on('connect', handlers.handleConnect);
-
   /**
    * Does the user's interactive shell consider this word an alias? Both zsh
    * ("cc is an alias for ...") and bash ("cc is aliased to ...") answer through
@@ -93,25 +101,6 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     // bash wraps the expansion in `backtick quote'; zsh leaves it bare.
     return match[1]!.trim().replace(/^`/, '').replace(/'$/, '');
   };
-
-  /** Minimal `which`: is this bare name an executable on PATH? */
-  const whichSync = (name: string, env: NodeJS.ProcessEnv): boolean => {
-    if (name.includes('/')) return false; // a path, already handled by existsSync
-    for (const dir of (env.PATH ?? '').split(':')) {
-      if (!dir) continue;
-      try {
-        accessSync(join(dir, name), constants.X_OK);
-        return true;
-      } catch {
-        // not here, keep looking
-      }
-    }
-    return false;
-  };
-
-  /** Can this word actually be executed: a path that exists, or a name on PATH. */
-  const isRunnable = (word: string, env: NodeJS.ProcessEnv): boolean =>
-    word.includes('/') ? existsSync(word) : whichSync(word, env);
 
   /** POSIX single-quote: safe for anything except a single quote itself. */
   const shellQuote = (arg: string): string => `'${arg.replaceAll("'", `'\\''`)}'`;
@@ -132,10 +121,14 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   const spawnResolved = (command: string[], env: NodeJS.ProcessEnv) => {
     const direct = { stdio: 'inherit', env } as const;
     const shell = env.SHELL || '/bin/sh';
+    // Native Windows has no /bin/sh, and Git Bash's SHELL=/usr/bin/bash is not
+    // a path Node can spawn. Without a usable shell there are no aliases to
+    // consult and no fallback to take.
+    const shellUsable = isRunnable(shell, env);
     // An alias can shadow a real binary: `cc` is Apple clang on PATH and a
     // Claude Code alias in the user's zsh, so PATH alone would silently run
     // the wrong program. Ask the interactive shell what the word means first.
-    const alias = shellAliasTarget(command[0]!, shell, env);
+    const alias = shellUsable ? shellAliasTarget(command[0]!, shell, env) : null;
     // But a stale alias must not shadow a working binary either. An alias
     // pointing at an uninstalled path (`claude` -> /opt/homebrew/bin/claude
     // after a move to a node-managed install) would otherwise fail the launch
@@ -147,6 +140,11 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
       console.error(`[pxpipe] warp: ignoring stale alias ${command[0]} → ${aliasWord} (not executable)`);
     }
     if (!aliasUsable && isRunnable(command[0]!, env)) {
+      return spawn(command[0]!, command.slice(1), direct);
+    }
+    if (!shellUsable) {
+      // Let spawn() report the real ENOENT for the command itself rather
+      // than a misleading one for a shell that was never there.
       return spawn(command[0]!, command.slice(1), direct);
     }
     console.error(`[pxpipe] warp: resolving ${command[0]} via interactive shell fallback`);
@@ -179,7 +177,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     // them a 1-cert file strips the public roots from every other HTTPS client
     // in the session (gcloud, gws, pip all fail verification — #245). They get
     // the bundle: our CA followed by the system roots.
-    env.NODE_EXTRA_CA_CERTS = ca.certPath; // Node, and Bun-compiled binaries
+    env.NODE_EXTRA_CA_CERTS = ca.bundlePath; // Node, and Bun-compiled binaries
     env.SSL_CERT_FILE = ca.bundlePath; // OpenSSL: curl, Rust, Go with cgo
     env.CURL_CA_BUNDLE = ca.bundlePath; // libcurl
     env.REQUESTS_CA_BUNDLE = ca.bundlePath; // Python requests / httpx

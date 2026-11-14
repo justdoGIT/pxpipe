@@ -94,6 +94,8 @@ function forwardHeaders(headers: IncomingHttpHeaders): Record<string, string | s
 }
 
 function pipeSockets(a: Socket, b: Socket): void {
+  a.setNoDelay?.(true);
+  b.setNoDelay?.(true);
   a.pipe(b);
   b.pipe(a);
   const destroy = () => {
@@ -130,6 +132,8 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     // absolute form must not be re-originated as `https://host:443`.
     origin: string,
   ) => {
+    req.socket?.setNoDelay?.(true);
+    res.socket?.setNoDelay?.(true);
     const path = requestUri.split('?')[0] ?? '/';
     const route = matchRoute(routes, hostPort, path);
 
@@ -152,11 +156,24 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       setHost: false,
       agent: target.protocol === 'https:' ? httpsAgent : httpAgent,
     });
+    outbound.setNoDelay?.(true);
 
     let upstreamRes: IncomingMessage | undefined;
+    const abortDownstream = (err?: Error): void => {
+      if (!res.writableEnded && !res.destroyed) {
+        res.destroy(err);
+      }
+    };
     outbound.on('response', (upstream) => {
       upstreamRes = upstream;
+      upstream.socket?.setNoDelay?.(true);
+      upstream.on('error', abortDownstream);
+      upstream.on('aborted', () => abortDownstream());
+      upstream.on('close', () => {
+        if (!upstream.complete) abortDownstream();
+      });
       res.writeHead(upstream.statusCode ?? 502, forwardHeaders(upstream.headers));
+      res.flushHeaders?.();
       // Streamed, never buffered: /v1/messages is SSE and must arrive token by
       // token or the agent appears to hang until the response completes.
       upstream.pipe(res);
@@ -165,7 +182,11 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       // Our own teardown below surfaces here as ECONNRESET; the client is
       // already gone, so writing a 502 into it would throw.
       if (res.writableEnded || res.destroyed) return;
-      if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
+      if (res.headersSent) {
+        res.destroy(err);
+        return;
+      }
+      res.writeHead(502, { 'content-type': 'text/plain' });
       res.end(`pxpipe warp: upstream error: ${err.message}`);
     });
     // An SSE completion only ends when the model stops. If the agent is killed
@@ -231,6 +252,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   mitmServer.on('clientError', (_err, socket) => socket.destroy());
 
   const handleConnect = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
+    clientSocket.setNoDelay?.(true);
     if (!isLoopbackAddress(req.socket.remoteAddress)) {
       clientSocket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
       return;
@@ -274,9 +296,19 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       res.end('pxpipe warp: unsupported scheme');
       return;
     }
+    // A pattern that names a port is matched against "host:port", and the
+    // CONNECT path always supplies one via authority(host, port) — but
+    // URL.host omits a DEFAULT port, so `api.anthropic.com:443/v1/*` matched
+    // a CONNECT and then silently missed the very same request in absolute
+    // form. Put the implied port back so both paths hand matchRoute the same
+    // authority. target.host already brackets an IPv6 literal and already
+    // carries a non-default port, so it only ever needs the default appended.
+    const hostPort = target.port
+      ? target.host
+      : `${target.host}:${target.protocol === 'https:' ? 443 : 80}`;
     // target.origin, not a rebuilt https:// URL: scheme and non-default port
     // are part of where this request was actually going.
-    forward(req, res, target.host, target.pathname + target.search, target.origin);
+    forward(req, res, hostPort, target.pathname + target.search, target.origin);
   };
 
   return { handleConnect, handleAbsoluteForm };

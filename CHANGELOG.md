@@ -4,6 +4,134 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## Unreleased
+
+## 0.16.0 — 2026-11-11
+
+### Added
+- **Experimental GPT-6 profile for Codex, with aligned quality evals** (#273). Includes per-profile image detail overrides (GPT-6 selects `original` detail by default) and benchmarks for GPT 6.1 Sol, Grok 4.7, and GPT-6 Astra.
+- **`claude-fable-5-2` evaluation** (#351). Arithmetic 100/100, gist 98/98, state 18/18, 0/16 confabulations.
+
+### Changed
+- **`claude-fable-5-1` and `claude-fable-5-2` render on the spaced profile (Spleen 5×8, +2px rows)** (#351). Only the original `claude-fable-5` reads the bare 5×8 cell. Dense hex, pure image (N=15): 5.1 `6/15 → 14/15`, 5.2 `7/15, 5/15 → 13/15, 11/15`. Gist stays 98/98 with 0/16 confabulations on both. Spaced pages cost more image tokens per page.
+- **Upstream streams pass through without default proxy timeouts** (#347). `upstreamHeadersTimeoutMs` and `upstreamIdleTimeoutMs` default to `0`. Google `streamGenerateContent` buffers a whole `functionCall.args` object before emitting a chunk, so a legitimate long tool call looked idle and was cut. Clients and gateways already own these timeouts.
+
+### Fixed
+- **Mid-stream upstream aborts close the downstream response and keep a `stream_error` receipt** (#349). An upstream SSE abort after headers emitted `aborted`/`close` rather than `error`, so `pxpipe warp` left the client socket open until the client's stall watchdog fired.
+- **Response headers flush immediately and proxy sockets set `TCP_NODELAY`** (#348). Headers were held until the first body chunk and small SSE frames were coalesced by Nagle across local hops.
+- **Gemini: the active user prompt and mid-work interjections stay pinned across history collapse** (#341).
+- **Responses: completed custom-tool history compresses as context grows; native factsheets are deduplicated within a request and priced correctly in the collapse gate** (#273).
+
+## 0.15.1 — 2026-10-25
+
+### Added
+- **DeepSeek V4.1 Flash 1017 (`@cf/deepseek-ai/deepseek-v4.1-flash-1017`) quality evaluation and 14px pilot receipts** (#329). Spleen 5×8 is illegible to DeepSeek V4.1 Flash (0/15 dense hex); at JetBrains Mono 14px (`84 cols`, `maxHeightPx: 768` to stay under Workers AI's 32-image request limit), it scores 100/100 novel arithmetic, 98/98 gist recall, 18/18 state tracking, 0/16 never-stated confabulations, and 8/15 dense hex. Kept eval-only via `PXPIPE_GPT_PROFILES` because DeepSeek's 98% native prompt-cache discount leaves negligible dollar savings at 14px density.
+- **Model support tier matrix, Gemini 4 Argon (`15/15`) external 6-document benchmark, and `pxpipe warp` agent guide (`agy`, `omp`, `opencode`)** (#335). Clarifies Tier 1 full-fidelity readers (`gemini-4-argon` 15/15 pure-image hex, `gemini-3.6/3.7/3.8-flash` 14/15, June 2026 `claude-fable-5` 13/15) versus Tier 2 gist-only readers (`claude-opus-5-5` 3/15, `claude-fable-5-1` 6/15, `claude-opus-5` 2/15) and unsupported models (`claude-haiku-5-5`, `claude-sonnet-5-5`). Records the 6-document TokenSave pure-image evaluation on `gemini-4-argon` (93% planted hex, 90% planted numbers, 10/10 Korean `prose_ko`, 80% unplanted log `req=` IDs) and documents why the bounded factsheet remains enabled in production to disambiguate single-pixel `0`↔`8` glyph pairs at 5×8.
+
+### Fixed
+- **`pxpipe warp` matches default `:443` and `:80` ports on absolute-form requests, matching the `CONNECT` path** (#334). `URL.host` omits default ports, so a route pattern naming `api.anthropic.com:443/v1/*` or `example.com:80/v1/*` matched `CONNECT` (where `authority(host, port)` always includes the port) and silently missed identical requests arriving in absolute form. `handleAbsoluteForm` in `src/warp/connect.ts` now restores the implied default port (`443` for `https:`, `80` for `http:`) without double-bracketing IPv6 literals.
+- **Forward requests with malformed `messages` / `input` array elements untouched instead of returning `502`** (#326). A `null` or primitive element inside `messages[]` (`/v1/messages`, `/v1/chat/completions`) or `input[]` (`/v1/responses`) previously threw an unguarded `TypeError` inside the transform and returned `502 {"error":"pxpipe transform failed"}`. All three entry points now bail out with `reason: 'invalid_messages'` / `'invalid_input'` and forward the original bytes untouched so the upstream API returns its normal `400`.
+- **Honest baseline savings estimates under server-side thread continuations and self-busted image caches** (#328). `buildBaselineCountTokensBody` and `buildCacheablePrefixCountTokensBody` prepend synthetic `tool_use` blocks (`prependSyntheticToolUses`) when a server-side thread delta opens with an orphan `tool_result`, preventing `400` responses on `count_tokens` probes. `deriveBaselineWarmth` prices the text counterfactual warm on `cache_read === 0` when a fresh same-session prior (`< 300s`) with matching `model`, `system_sha8`, and `cache_prefix_tools_sha8` proves that pxpipe changed its own `cache_prefix_sha8`, charging self-inflicted image-cache misses to pxpipe rather than booking them as cold-text savings.
+- **Dependency security maintenance.** Bumped `pnpm.overrides.undici` from `7.30.0` to `7.30.1` so `pnpm audit` passes with 0 vulnerabilities.
+
+## 0.15.0 — 2026-10-18
+
+### Added
+- **Gemini 4 (`gemini-4-argon`, `gemini-4`, `gemini-4-flash`, `gemini-4-pro`) support, split `GEMINI_PROFILE` vs `GEMINI_LEGACY_PROFILE`, and adaptive Google history packing** (#322, #324). `GEMINI_PROFILE` (`gemini-4*`, `gemini-pro`, and future 4+ models) raises `history.maxImages` from 32 to 96 and uses `responsesMode: 'mixed'` (matching `CLAUDE_PROFILE`), while `GEMINI_LEGACY_PROFILE` (`gemini-3.x-flash*`) retains `maxImages: 32` and `responsesMode: 'pairs'`. `planGoogleHistory` now packs closed tool-call boundaries up to `READABLE_CHARS_PER_IMAGE` (~28k chars/page) instead of flushing a separate image every 8 turns, drops historical `thought: true` blocks from rendered history images, and unwraps `functionResponse.response.{content,output,result,error}` payloads in `compressGoogleToolResults` and `googleHistoryUnit` (~83% input token savings on multi-hundred-turn Gemini 4 sessions). Added the "Gemini 4" dashboard catalog chip and full Gemini 4 Argon benchmark receipts (100/100 novel arithmetic, 98/98 gist recall, 18/18 state tracking, 0/16 confabulations, 15/15 dense 12-char hex recall).
+- **`GOOGLE_UPSTREAM` environment variable and `pxpipe warp` `NODE_EXTRA_CA_CERTS` propagation** (#323, #324). Sets an explicit Google AI Studio / Cloud Code upstream base URL when `ANTHROPIC_UPSTREAM` / `OPENAI_UPSTREAM` point at a different router, and passes `NODE_EXTRA_CA_CERTS` in `pxpipe warp` so child Node/Bun processes retain system and corporate root CAs alongside the warp leaf CA.
+- **Claude Sonnet 5.5 (`claude-sonnet-5-5`) dashboard chip and benchmark evaluation results** (#298).
+
+### Fixed
+- **Tool-result imaging runs when the static slab is below its gate** (#321, fixes #320). On Claude Code >= 2.1.281 first-party thread continuation deltas (`thread: { type: "continue" }`), the 2-message delta carries only the billing header in `system` and no `tools`, hitting the `below_min_chars` early exit before Step 5b ran. `runHistoryCollapseAndFinalize` now invokes `compressToolResultsInPlace` after history collapse on both the main path and all four slab early-exit paths (`below_min_chars`, `image_budget`, `not_profitable`, `slabOverCount`/`slabOverBytes`) while preserving the slab diagnostic `info.reason`.
+- **Separate the `↵` (`U+21B5`) hard-newline marker with a blank cell on each side** (#281, fixes #270). `padNewlineMarkers` in `src/core/render.ts` surrounds every `↵` marker with one blank cell on each side (` ↵ `) in `wrapLines` and `measureContentCols` (and skips re-padding pre-wrapped pages in `renderTextToPngsUncached`) so line-ending values and next-line identifiers never fuse into a single visual token.
+- **Preserve long opening task contracts across multi-turn history collapse** (#250, fixes #233). `demoteProtectedHeadText` in `src/core/history.ts` uses `verbatimTaskText` (up to 4,000 chars) instead of `compactPreview` (300 chars) when an opening prompt exceeds `USER_TEXT_MAX_CHARS` (1,200 chars), keeping requirements beyond char 300 in Turn 0's tombstone when later user turns supersede `latestCollapsedUserPointer`.
+- **Windows build `tsc` path resolution and `pxpipe warp` OS certificate store fallback** (#309, #308). `scripts/build.mjs` resolves `tsc` via `path.resolve(dirname(pkgPath), require(pkgPath).bin.tsc)` (`scripts/resolve-tsc.mjs`) instead of `new URL(..., 'file://').pathname` (which produced `/C:/...` on Windows). When no PEM root bundle file exists on disk (Windows), `src/warp/ca.ts` falls back to Node 22.15+/23.10+'s `tls.getCACertificates('system')` so `warp-ca-bundle.pem` includes OS root certificates.
+- **Keep index-less streamed tool-call fragments in one `tool_use` block** (#264). `chatStreamEvent` in `src/core/messages-chat-bridge.ts` tracks `state.lastToolKey` so OpenAI-compatible providers that omit `index` on continuation `tool_calls` deltas append argument chunks to the active block instead of opening a new block per chunk.
+- **Malformed request-shape guards across history, pin, and Google scanners** (#263, #262, #259). Guarded null/non-object content blocks in `isPinReply` (`src/core/pin.ts`), non-array `message.content` in `blocksToText` (`src/core/history.ts`), and null elements inside `content.parts` in `planGoogleHistory` (`src/core/google.ts`).
+- **Test isolation and dependency maintenance** (#305, #304, #287, #319, #318, #317, #316, #315, #310, #290). Isolated `tests/node-security.test.ts` child processes with `PXPIPE_SESSION_STATE: 'off'`, fixed `cache_create_5m_tokens` / `cache_create_1h_tokens` assertions in `tests/tracker.test.ts`, updated default model scope comments in `src/core/applicability.ts`, and updated dev/CI dependencies (`vitest` 5.0.4, `vite` 8.3.4, `@napi-rs/canvas` 1.0.11, `@types/node` 26.6.5, `tsx` 4.23.15, `@cloudflare/workers-types` 5.20261011.1, `actions/setup-node` 7.1.0, `undici` 7.30.0, `sharp` 0.35.5).
+
+## 0.14.0 — 2026-09-28
+
+### Added
+- **Session state survives proxy restarts** (#295). The freeze step is a pin:
+  once a session's history is packed at a coarse grid it must never be
+  re-rendered finer, or every history chunk re-keys and the provider bills the
+  whole prefix as `cache_create`. The pin lived only in memory, so each restart
+  let the next collapse pick a finer step. The Node host now saves the
+  freeze-step floor and cache liveness to `~/.pxpipe/session-state.json` (mode
+  0600, written to a temp file and renamed, debounced 250 ms, flushed on
+  shutdown). `PXPIPE_SESSION_STATE=<path>` moves it and `0`/`off` turns it off.
+  Records idle more than 24 h and malformed records are dropped on load. Core
+  stays filesystem-free: hosts attach a store via
+  `configureSessionStateStore()`.
+- **`pxpipe warp` supports agy (Antigravity CLI)** (#271). Warp routes the
+  Cloud Code (`daily-cloudcode-pa.googleapis.com/v1internal:*`) and
+  `generativelanguage.googleapis.com` generate-content endpoints to the proxy.
+
+### Changed
+- **Opus 5.5 is on by default, and every non-Fable Claude model uses the
+  spaced 5×8 profile** (#293). Opus 5.5 misread the bare 5×8 cell that Fable
+  reads cleanly (84/98 gist). Adding 2px of row height fixes it (93/98 gist,
+  0/16 confabulations, 100/100 arithmetic) and still costs about 1.9× less
+  than text. `CLAUDE_SPACED_PROFILE` (312 cols, `cellHBonus: 2`) replaces the
+  14px legible profile, which cost more than sending text and is removed.
+  `claude-opus-5-5` joins the default scope, and `DEFAULT_EXPORT_COLS` goes
+  from 172 to 312 to match. Exact 12-char hex recall stays weak (3/15, same as
+  the dense control), so exact ids still come from the factsheet or a
+  re-fetch.
+- **Gemini is on by default for every version, and opt-out works again.** The
+  built-in scope is now
+  `PXPIPE_MODELS=claude-fable-5,claude-opus-5-5,gemini`; the `gemini`
+  family base matches `gemini-3.6-flash`, `gemini-4`, `gemini-pro`, and future
+  ids through the ordinary prefix rule. The Google gate in the proxy and the
+  dashboard totals previously admitted any measured Gemini model whenever the
+  allowlist was non-empty, which made `PXPIPE_MODELS=claude-fable-5` (and the
+  dashboard chip) unable to turn Gemini off. That bypass is removed; the
+  allowlist is the only gate. Dashboard: one "Gemini (all versions)" chip plus
+  per-version chips for narrowing.
+- `gpt-tokenizer` 3.4 → 4.0 (major), used for o200k token counts on the
+  OpenAI and Google paths (#242).
+
+### Fixed
+- **Concurrent sessions no longer share one cache record.** `first_user_sha8`
+  hashed the first text block of the first user message, which for omp is the
+  same `<system-notice>` device inventory in every session (and for Claude Code
+  the project's CLAUDE.md `<system-reminder>`). Every session in the project
+  collapsed onto one key, so one session's `cache_create`/`cache_read` outcomes
+  and freeze step drove the others' history-grid decisions: pages re-cut and
+  re-keyed the image prefix as `cache_create`. The key now skips blocks that
+  are wholly a `<system-notice>`/`<system-reminder>` envelope and uses the
+  first prompt text before the first assistant turn. Dashboard session groups
+  and the Claude Code transcript map use the same rule; events logged before
+  the fix keep their old keys.
+- **Provider-prefixed paths no longer double `/anthropic`.** With an
+  `ANTHROPIC_UPSTREAM` ending in `/anthropic`, a client path of
+  `/anthropic/v1/messages` was appended as-is:
+
+  ```text
+  Before: …/anthropic/anthropic/v1/messages
+  After:  …/anthropic/v1/messages
+  ```
+
+  Both the main forward and the baseline `count_tokens` probe had this bug.
+  The probe got a 403, so every row logged `baseline_probe_status: "failed"`
+  and the dashboard reported 0% fewer tokens. Both now drop the duplicated
+  segment when the base already ends with it.
+- **`@pxpipe pin` works on the OpenAI and Google paths.** Pins were moved to
+  the tail only for Anthropic requests; OpenAI Chat/Responses and Gemini
+  requests now get the same relocation.
+- **`pxpipe warp -- claude` works on native Windows** (#294). It failed with
+  `spawn /bin/sh ENOENT`: `PATH` was split on `:`, `PATHEXT` was ignored, and
+  `C:\…` paths weren't recognised as paths, so every lookup fell through to a
+  `$SHELL -ic` fallback that defaults to `/bin/sh`. Resolution now handles
+  `PATH`/`PATHEXT` per platform (only `.com`/`.exe`, since `spawn()` can't run
+  `.cmd`/`.bat` without a shell) and skips the shell fallback when the shell
+  itself can't run.
+- **Google upstream selection only trusts known hosts** (#271). The `Host`
+  header is parsed and matched exactly against the Cloud Code hostnames before
+  routing, and trailing-slash stripping no longer uses a regex that could
+  backtrack on long input.
+
 ## 0.13.2 — 2026-08-18
 
 ### Added

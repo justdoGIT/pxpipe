@@ -22,7 +22,7 @@ import {
   openAIChatToAnthropicResponse,
 } from './messages-chat-bridge.js';
 import { pinCommandResponse, pinCommandResponseOpenAI } from './pin.js';
-import { parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
+import { isGoogleInferencePath, parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
 import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
 
@@ -47,6 +47,8 @@ export interface ProxyConfig {
   openAIUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
   openAIApiKey?: string;
+  /** Google API base for Gemini / CloudCode inference, no trailing slash. */
+  googleUpstream?: string;
   /** Cloudflare's OpenAI-compatible Chat Completions endpoint and bearer key. */
   cloudflareUpstream?: string;
   cloudflareApiKey?: string;
@@ -64,10 +66,10 @@ export interface ProxyConfig {
   captureErrorReqBody?: boolean;
   /** Abort the upstream request if response headers have not arrived within this
    *  many ms. Cleared once headers land, so long generations are unaffected.
-   *  0 disables. */
+   *  0 (default) disables so upstream and client control timeouts. */
   upstreamHeadersTimeoutMs?: number;
-  /** Abort the upstream response if no bytes arrive for this many ms. This is the
-   *  stall guard: a wedged connection can otherwise be held open forever. 0 disables. */
+  /** Abort the upstream response if no bytes arrive for this many ms.
+   *  0 (default) disables so buffered tool-call streams pass through as-is. */
   upstreamIdleTimeoutMs?: number;
   /** How long an in-flight request may reject an identical retry before the dedupe
    *  fails open. Prevents one stalled request from permanently 409-ing its retries.
@@ -133,10 +135,9 @@ export interface ProxyEvent {
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
 const ERROR_BODY_MAX = 2048;
 
-/** Headers should arrive well inside this; generous enough for slow reasoning starts. */
-const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 300_000;
-/** No bytes for this long means the connection is wedged, not slow. */
-const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 120_000;
+/** Disabled by default (0): upstream and client control request/stream timeouts. */
+const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 0;
+const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 0;
 /** Past this, an in-flight entry is treated as stale and a retry is let through. */
 const DEFAULT_DUPLICATE_HOLD_MS = 60_000;
 /**
@@ -198,7 +199,7 @@ function withIdleTimeout(
         // same wait the headers budget covers. Real traffic has taken >120s just to
         // return headers (max 146s over 41k requests), so charging the mid-stream idle
         // budget here would abort healthy slow starts.
-        arm(firstChunkMs);
+        arm(firstChunkMs > 0 ? firstChunkMs : ms);
       },
       transform(chunk, controller) {
         // Bytes have flowed: from here a long silence means wedged, not slow.
@@ -590,9 +591,10 @@ function processSseEvent(
   ) {
     m.toolUseChars += obj.delta.length;
   }
-  // Google AI Studio streaming chunks: usageMetadata object.
-  if (obj.usageMetadata && typeof obj.usageMetadata === 'object') {
-    const gUsage = normalizeUsage(obj.usageMetadata);
+  // Google AI Studio / CloudCode streaming chunks: usageMetadata object.
+  const usageObj = obj.usageMetadata ?? (obj.response as Record<string, unknown> | undefined)?.usageMetadata;
+  if (usageObj && typeof usageObj === 'object') {
+    const gUsage = normalizeUsage(usageObj);
     if (gUsage) state.usage = gUsage;
   }
   measureGoogleCandidates(obj, m, state);
@@ -791,8 +793,13 @@ function measureGoogleCandidates(
   m: OutputMeasurement,
   state?: { stopReason: string | undefined },
 ): boolean {
-  if (!Array.isArray(obj.candidates)) return false;
-  for (const rawCandidate of obj.candidates) {
+  const candidates = Array.isArray(obj.candidates)
+    ? obj.candidates
+    : (obj.response && typeof obj.response === 'object' && Array.isArray((obj.response as Record<string, unknown>).candidates))
+      ? (obj.response as Record<string, unknown>).candidates as unknown[]
+      : undefined;
+  if (!Array.isArray(candidates)) return false;
+  for (const rawCandidate of candidates) {
     const candidate = objectRecord(rawCandidate);
     if (!candidate) continue;
     if (state && typeof candidate.finishReason === 'string') state.stopReason = candidate.finishReason;
@@ -873,6 +880,7 @@ function teeForUsage(
   res: Response,
   assumeResponsesSse = false,
   assumeResponsesJson = false,
+  retainStreamReceipt = false,
 ): {
   response: Response;
   usagePromise: Promise<Usage | undefined>;
@@ -948,6 +956,11 @@ function teeForUsage(
     const reader = forUs.getReader();
     const decoder = new TextDecoder();
     let buf = '';
+    let streamedMeasurement: OutputMeasurement | undefined;
+    const state: { usage: Usage | undefined; stopReason: string | undefined } = {
+      usage: undefined,
+      stopReason: undefined,
+    };
 
     try {
       // ChatGPT's /backend-api/codex/responses currently omits Content-Type.
@@ -961,10 +974,7 @@ function teeForUsage(
           toolUseChars: 0,
           redactedBlockCount: 0,
         };
-        const state: { usage: Usage | undefined; stopReason: string | undefined } = {
-          usage: undefined,
-          stopReason: undefined,
-        };
+        streamedMeasurement = m;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -1010,7 +1020,11 @@ function teeForUsage(
           };
           const state: { stopReason: string | undefined } = { stopReason: undefined };
           for (const object of objects) {
-            const nextUsage = normalizeUsage(object.usage ?? object.usageMetadata);
+            const nextUsage = normalizeUsage(
+              object.usage
+                ?? object.usageMetadata
+                ?? (object.response as Record<string, unknown> | undefined)?.usageMetadata,
+            );
             if (nextUsage) usage = nextUsage;
             recognizedGoogle = measureGoogleCandidates(object, measurement, state) || recognizedGoogle;
           }
@@ -1025,7 +1039,13 @@ function teeForUsage(
         }
       }
     } catch {
-      /* tee released early (client abort) */
+      if (retainStreamReceipt) {
+        return {
+          usage: state.usage,
+          measurement: streamedMeasurement,
+          stopReason: state.stopReason ?? 'stream_error',
+        };
+      }
     }
     // Unknown content-type: drain to release the tee buffer.
     try {
@@ -1094,6 +1114,14 @@ const PASSTHROUGH_PREFIXES = [
 
 function isProviderPrefixedPath(pathname: string): boolean {
   return PASSTHROUGH_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+}
+
+/** Append a provider-prefixed path without doubling the provider segment when
+ *  the base already ends with it: base `http://h/anthropic` plus
+ *  `/anthropic/v1/messages` is `http://h/anthropic/v1/messages`. */
+function joinProviderPath(base: string, path: string): string {
+  const segment = /^\/[^/?]+/.exec(path)?.[0];
+  return segment && base.endsWith(segment) ? base.slice(0, -segment.length) + path : base + path;
 }
 
 /** One optional gateway/provider segment, then an optional `/v1`, before the
@@ -1273,7 +1301,10 @@ async function countGoogleTokensUpstream(
   model: string,
 ): Promise<number | null> {
   try {
-    const request = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
+    const rawParsed = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
+    const request = (rawParsed.request && typeof rawParsed.request === 'object' && !Array.isArray(rawParsed.request))
+      ? (rawParsed.request as Record<string, unknown>)
+      : rawParsed;
     const shapeBare = JSON.stringify(request);
     const shapeWrapped = JSON.stringify({ generateContentRequest: { ...request, model: `models/${model}` } });
     let host = '';
@@ -1365,6 +1396,52 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
     out[pair.slice(0, i).trim()] = pair.slice(i + 1).trim();
   }
   return out;
+}
+
+function extractHostname(hostHeader: string | null): string {
+  if (!hostHeader) return '';
+  const trimmed = hostHeader.trim().toLowerCase();
+  if (trimmed.startsWith('[')) {
+    const end = trimmed.indexOf(']');
+    return end !== -1 ? trimmed.slice(1, end) : trimmed;
+  }
+  const colon = trimmed.indexOf(':');
+  return colon !== -1 ? trimmed.slice(0, colon) : trimmed;
+}
+
+function stripTrailingSlashes(str: string): string {
+  let end = str.length;
+  while (end > 0 && str.charCodeAt(end - 1) === 47) {
+    end--;
+  }
+  return str.slice(0, end);
+}
+
+function resolveGoogleUpstream(
+  req: Request,
+  pathname: string,
+  passthroughUpstream: string,
+  config: ProxyConfig,
+): string {
+  if (config.googleUpstream) {
+    return stripTrailingSlashes(config.googleUpstream.trim());
+  }
+  if (config.provider === 'cloudflare-ai-gateway') {
+    return passthroughUpstream;
+  }
+  const host = extractHostname(req.headers.get('host'));
+  if (host === 'daily-cloudcode-pa.googleapis.com' || host === 'cloudcode-pa.googleapis.com' || pathname.startsWith('/v1internal:')) {
+    return host === 'cloudcode-pa.googleapis.com'
+      ? 'https://cloudcode-pa.googleapis.com'
+      : 'https://daily-cloudcode-pa.googleapis.com';
+  }
+  if (host === 'generativelanguage.googleapis.com') {
+    return 'https://generativelanguage.googleapis.com';
+  }
+  if (passthroughUpstream !== DEFAULT_UPSTREAM && !passthroughUpstream.endsWith('/anthropic')) {
+    return passthroughUpstream;
+  }
+  return 'https://generativelanguage.googleapis.com';
 }
 
 /** Build the proxy fetch handler. */
@@ -1556,23 +1633,27 @@ let responseContentType: string | undefined;
     const isMessages = !bypass && isMessagesWire;
     const isOpenAIChat = !bypass && isOpenAIChatWire;
     const isOpenAIResponses = !bypass && isOpenAIResponsesWire;
-    const googleModel = req.method === 'POST'
+    const googleModelFromPath = req.method === 'POST'
       ? parseGoogleModelFromPath(url.pathname)
       : null;
-    const isGoogleRoute = googleModel !== null;
+    const isGoogleInference = req.method === 'POST' && isGoogleInferencePath(url.pathname);
+    const isGoogleRoute = googleModelFromPath !== null || isGoogleInference;
     const isGoogle = isGoogleRoute && !bypass;
     const isOpenAIPath = isCanonicalOpenAIPath(
       url.pathname,
       req.headers,
       config.openAIApiKey !== undefined,
     );
-    const upstreamBase = isGoogleRoute || providerPrefixed
-      ? passthroughUpstream
-      : isOpenAIPath ? openAIUpstream : upstream;
+    const googleUpstream = resolveGoogleUpstream(req, url.pathname, passthroughUpstream, config);
+    const upstreamBase = isGoogleRoute
+      ? googleUpstream
+      : providerPrefixed
+        ? passthroughUpstream
+        : isOpenAIPath ? openAIUpstream : upstream;
 
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
-    let requestModel: string | undefined = googleModel ?? undefined;
+    let requestModel: string | undefined = googleModelFromPath ?? undefined;
     let bridgedGptMessages = false;
     let bridgedChatMessages = false;
     let modelRouteForRequest: 'openai' | 'cloudflare' | undefined;
@@ -1619,7 +1700,7 @@ let responseContentType: string | undefined;
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
         // Fail-closed: unreadable model → no compression, not a risky guess.
-const model = googleModel ?? readModelField(bodyIn);
+        const model = googleModelFromPath ?? readModelField(bodyIn);
         if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
         requestModel = model ?? undefined;
         // A turn whose only content is `@pxpipe pin` / `@pxpipe unpin` is
@@ -1664,8 +1745,10 @@ const model = googleModel ?? readModelField(bodyIn);
         bridgedChatMessages = forceChat;
         const chatStamp = bridgedChatMessages ? routedModel : undefined;
         const effectiveModel = (bridgedGptMessages || bridgedChatMessages) ? routedModel : model;
+        // Gemini is in DEFAULT_MODEL_BASES as the family base `gemini`; the same
+        // allowlist gates it so PXPIPE_MODELS / the chip can opt out.
         const modelOk = isGoogle
-          ? isGeminiModel(model) && isPxpipeSupportedModel(model)
+          ? (isGeminiModel(model) && isPxpipeSupportedModel(model))
           : isMessages
             ? (messagesAnthropic && isPxpipeSupportedModel(model))
               || bridgedGptMessages
@@ -1710,7 +1793,7 @@ const model = googleModel ?? readModelField(bodyIn);
           const countHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
           countHeaders.set('content-type', 'application/json');
           const countUrl = new URL(
-            passthroughUpstream + url.pathname.replace(
+            (isGoogleRoute ? googleUpstream : passthroughUpstream) + url.pathname.replace(
               /:(?:generateContent|streamGenerateContent)$/,
               ':countTokens',
             ),
@@ -1785,9 +1868,11 @@ const model = googleModel ?? readModelField(bodyIn);
             if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
             // Mirror the actual outbound request base+path: count_tokens lives at
             // `<messages-path>/count_tokens`, so provider-prefixed routes like
-            // `/anthropic/messages` probe `/anthropic/messages/count_tokens`.
-            const ctBase = providerPrefixed ? passthroughUpstream : upstream;
-            const ctUrl = ctBase + url.pathname + '/count_tokens';
+            // `/anthropic/messages` probe `/anthropic/messages/count_tokens`,
+            // joined like the main forward so a `…/anthropic` base isn't doubled.
+            const ctUrl = providerPrefixed
+              ? joinProviderPath(passthroughUpstream, url.pathname + '/count_tokens')
+              : upstream + url.pathname + '/count_tokens';
             baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders);
             // Null = no markers → cacheable=0 by definition, no probe needed.
             const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
@@ -1880,6 +1965,8 @@ const model = googleModel ?? readModelField(bodyIn);
         else if (decision.action === 'replace') outHeaders.set('authorization', `Bearer ${bridgeKey}`);
         // 'keep-inbound' leaves the header filterHeaders already copied.
       }
+    } else if (isGoogleRoute) {
+      // Inbound Google credential (Bearer or API key) is preserved; do not inject Anthropic keys.
     } else if (!providerPrefixed || url.pathname.startsWith('/anthropic/')) {
       if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
       const bearer = resolveAuthToken(config);
@@ -1917,7 +2004,9 @@ const model = googleModel ?? readModelField(bodyIn);
         ? (routes.stripOpenAIV1 ? '/responses' : '/v1/responses')
         : isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
       const requestUpstreamBase = bridgedGptMessages ? openAIUpstream : upstreamBase;
-      upstreamUrl = requestUpstreamBase + outPath;
+      upstreamUrl = providerPrefixed && !bridgedGptMessages
+        ? joinProviderPath(requestUpstreamBase, outPath)
+        : requestUpstreamBase + outPath;
     }
     let releaseInFlight = (): void => {};
     if (reqBodySha256 && duplicateHoldMs > 0) {
@@ -2052,6 +2141,7 @@ let teed: Response;
           upstreamRes,
           isOpenAIResponsesWire && responsesStreaming,
           isOpenAIResponsesWire && !responsesStreaming,
+          isMessages || isGoogle || isOpenAIChatWire || isOpenAIResponsesWire || bridgedGptMessages || bridgedChatMessages,
         ));
     } catch (e) {
       releaseInFlight();
@@ -2083,7 +2173,7 @@ let teed: Response;
       fire(
         upstreamRes.status,
         info,
-        undefined,
+        timeoutKind === 'idle' ? `upstream_timeout: no upstream bytes for ${idleTimeoutMs}ms` : undefined,
         firstByteMs,
         usage,
         config.captureErrorReqBody ? errorBody : undefined,

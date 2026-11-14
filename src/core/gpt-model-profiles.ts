@@ -23,7 +23,7 @@
 import { type RenderFont } from './render.js';
 import { hasGeminiMeasuredProfile, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { isClaudeModel, resolveClaudeProfile } from './claude-model-profiles.js';
-import { BASE_HISTORY, BASE_PRICING, BASE_STYLE } from './profile-base.js';
+import { BASE_HISTORY, BASE_PRICING, BASE_STYLE, NATIVE_14PX_HISTORY } from './profile-base.js';
 
 export const GPT_MAX_HEIGHT_PX = 1932;
 
@@ -78,6 +78,18 @@ export interface GptHistoryProfile {
   keepRecentPairs: number;
   /** Local o200k floor before history profitability is evaluated. */
   minCollapseTokens: number;
+  /** Chat-completions only: minimum closed turns before history images.
+   *  Undefined keeps the planner default (10). */
+  minCollapsePrefix?: number;
+  /** Chat-completions only: snap the collapse boundary to this many turns.
+   *  Undefined keeps the planner default (10). Native-14px sets 1. */
+  collapseChunk?: number;
+  /** Chat-completions only: freeze imaged chunks on this turn grid.
+   *  Undefined keeps the planner default (10). Native-14px sets 1. */
+  freezeChunk?: number;
+  reflow?: boolean;
+  factSheetOverflow?: 'native-opaque';
+  maxCachePaybackReads?: number;
   /** Responses items eligible for history images. */
   responsesMode: 'pairs' | 'mixed';
   /** Native text bracketing each history image group. */
@@ -87,11 +99,15 @@ export interface GptHistoryProfile {
 }
 
 export interface GptModelProfile {
+  /** Optional outbound image detail; shared by runtime and profile evaluations. */
+  imageDetail?: 'high' | 'original';
   /** How this model's provider bills the rendered images as input tokens. */
   vision: GptVisionCost;
   /** Cached-input list price ÷ uncached-input list price for this family.
    *  Savings reporting reads this instead of re-classifying the model id. */
   cacheReadRate: number;
+  cacheWriteRate?: number;
+  cacheBreakpoints?: boolean;
   /** Output list price ÷ uncached-input list price for this family. */
   outputRate: number;
   /** Max portrait-strip width in columns. Combined with `style`, this must stay
@@ -189,7 +205,9 @@ export const DEFAULT_GPT_PROFILE: GptModelProfile = {
 };
 
 const GPT56_SOL_PROFILE: GptModelProfile = {
-  // GPT-5.6 original detail bills the submitted 32px patches without a patch cap.
+  cacheWriteRate: 1.25,
+  cacheBreakpoints: true,
+  // GPT-5.6 / GPT-6.1 Sol original detail bills the submitted 32px patches without a patch cap.
   vision: { regime: 'patch', multiplier: 1 },
   ...GPT5_PRICING,
   // Sol pins an exact static slab, so the gate compares against the measured
@@ -204,23 +222,49 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
   minCompressTokens: 500,
   factSheetFormat: 'full',
   history: {
-    ...BASE_HISTORY,
+    ...NATIVE_14PX_HISTORY,
+    // Taller 1954px pages: more chars/image, so Sol can hold a larger budget
+    // without the 512px latency cliff that Grok/Qwen hit.
     maxImages: 64,
-    // The latest user request is protected independently by the Responses
-    // planner. Keep only one additional recent message/pair native so closed,
-    // unreferenced history does not dominate long stateless requests.
-    keepTail: 1,
-    keepRecentPairs: 1,
-    minCollapseTokens: 1000,
-    responsesMode: 'mixed',
-    framing: 'compact',
-    factSheetScope: 'combined',
   },
   style: {
     ...BASE_STYLE,
     font: 'jetbrains-mono-14',
     cellWBonus: 0,
     cellHBonus: 0,
+  },
+};
+
+const GPT6_PROFILE: GptModelProfile = {
+  ...DEFAULT_GPT_PROFILE,
+  imageDetail: 'original',
+  vision: { regime: 'patch', multiplier: 1.2 },
+  stripCols: 152,
+  cacheReadRate: 0.1,
+  cacheWriteRate: 1.25,
+  cacheBreakpoints: true,
+  outputRate: 5,
+  exactStaticBaseline: true,
+  factSheetFormat: 'compact',
+  history: {
+    ...BASE_HISTORY,
+    maxImages: 200,
+    keepTail: 1,
+    keepRecentPairs: 1,
+    minCollapseTokens: 0,
+    minCollapsePrefix: 1,
+    collapseChunk: 1,
+    freezeChunk: 1,
+    reflow: true,
+    factSheetOverflow: 'native-opaque',
+    maxCachePaybackReads: 10,
+    responsesMode: 'mixed',
+    framing: 'compact',
+    factSheetScope: 'per-segment',
+  },
+  style: {
+    ...BASE_STYLE,
+    font: 'spleen-5x8',
   },
 };
 
@@ -263,6 +307,19 @@ const miniNanoProfile = (
  *   mini/nano -> patch (nano 2.46 / mini 1.62, cap 1536), BEFORE 5.x flagship.
  */
 const BUILTIN_RULES: ProfileRule[] = [
+  // Exact Sol variant observed on production traffic. Do not match bare 5.6/6.1
+  // or sibling variants (for example gpt-5.6-terra): model-specific visual
+  // tuning must not leak across variants merely because they share a version
+  // number. Evaluated before the generic gpt-6 family rule so gpt-6.1-sol
+  // inherits Sol's native 14px profile rather than GPT6_PROFILE's 5x8 Spleen.
+  {
+    test: (m) => /^gpt-(?:5\.6|6\.1)-sol(?:-|$)/.test(m),
+    profile: GPT56_SOL_PROFILE,
+  },
+  {
+    test: (m) => /^gpt-6(?:[.-]|$)/.test(m),
+    profile: GPT6_PROFILE,
+  },
   // nano patch models: ceil(patches * 2.46), cap 1536
   {
     test: (m) => isMiniNanoPatch(m) && /nano/.test(m) && /^gpt-5/.test(m),
@@ -282,13 +339,6 @@ const BUILTIN_RULES: ProfileRule[] = [
   {
     test: isMiniNanoPatch,
     profile: miniNanoProfile(1.62, BASE_PRICING),
-  },
-  // Exact Sol variant observed on production traffic. Do not match bare 5.6 or
-  // sibling variants (for example gpt-5.6-terra): model-specific visual tuning
-  // must not leak across variants merely because they share a version number.
-  {
-    test: (m) => m === 'gpt-5.6-sol' || m.startsWith('gpt-5.6-sol-'),
-    profile: GPT56_SOL_PROFILE,
   },
   // 5.x flagship (gpt-5.4/5.5/…, no -mini/-nano): patch, multiplier 1, detail:original cap
   {
@@ -325,7 +375,11 @@ const BUILTIN_RULES: ProfileRule[] = [
       maxHeightPx: 512,
       minCompressTokens: 500,
       factSheetFormat: 'full',
-      history: { ...BASE_HISTORY, maxImages: 24 },
+      // pairs only groups INDEX-CONTIGUOUS tool rounds. Codex puts an assistant
+      // message between rounds, so every round is its own run and leftover
+      // history stays text — which is why grok-4.6 showed ~0 saved. mixed
+      // groups safe messages with completed pairs.
+      history: { ...NATIVE_14PX_HISTORY },
       style: {
         ...BASE_STYLE,
         font: 'jetbrains-mono-14',
@@ -351,7 +405,7 @@ const BUILTIN_RULES: ProfileRule[] = [
       maxHeightPx: 512,
       minCompressTokens: 500,
       factSheetFormat: 'full',
-      history: { ...BASE_HISTORY, maxImages: 32, keepTail: 1 },
+      history: { ...NATIVE_14PX_HISTORY },
       style: {
         ...BASE_STYLE,
         font: 'jetbrains-mono-14',
@@ -502,7 +556,10 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
     // An exact override key may be a prefix of the real model id. Resolve the
     // known family explicitly so `{"gpt-5.6-sol":{...}}` inherits Sol's font
     // and geometry even when a suffixed runtime id is expected.
-    const base = key === 'gpt-5.6-sol' ? GPT56_SOL_PROFILE : resolveBuiltin(key);
+    const base =
+      key === 'gpt-5.6-sol' || key === 'gpt-6.1-sol'
+        ? GPT56_SOL_PROFILE
+        : resolveBuiltin(key);
     const p = v as Partial<GptModelProfile>;
     const styleIn = (p as { style?: GptRenderStyle }).style;
     const historyIn = (p as { history?: Partial<GptHistoryProfile> }).history;
@@ -529,6 +586,20 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       keepTail: nonNegativeInt(historyIn?.keepTail, baseHistory.keepTail),
       keepRecentPairs: nonNegativeInt(historyIn?.keepRecentPairs, baseHistory.keepRecentPairs),
       minCollapseTokens: nonNegativeInt(historyIn?.minCollapseTokens, baseHistory.minCollapseTokens),
+      minCollapsePrefix: historyIn?.minCollapsePrefix === undefined
+        ? baseHistory.minCollapsePrefix
+        : nonNegativeInt(historyIn.minCollapsePrefix, baseHistory.minCollapsePrefix ?? 10),
+      collapseChunk: historyIn?.collapseChunk === undefined
+        ? baseHistory.collapseChunk
+        : nonNegativeInt(historyIn.collapseChunk, baseHistory.collapseChunk ?? 10),
+      freezeChunk: historyIn?.freezeChunk === undefined
+        ? baseHistory.freezeChunk
+        : nonNegativeInt(historyIn.freezeChunk, baseHistory.freezeChunk ?? 10),
+      reflow: typeof historyIn?.reflow === 'boolean' ? historyIn.reflow : baseHistory.reflow,
+      factSheetOverflow: historyIn?.factSheetOverflow === 'native-opaque' ? historyIn.factSheetOverflow : baseHistory.factSheetOverflow,
+      maxCachePaybackReads: historyIn?.maxCachePaybackReads === undefined
+        ? baseHistory.maxCachePaybackReads
+        : nonNegativeInt(historyIn.maxCachePaybackReads, baseHistory.maxCachePaybackReads ?? 10),
       responsesMode: responsesMode(historyIn?.responsesMode, baseHistory.responsesMode),
       framing: historyFraming(historyIn?.framing, baseHistory.framing),
       factSheetScope: factSheetScope(historyIn?.factSheetScope, baseHistory.factSheetScope),
@@ -545,8 +616,11 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       : posInt(p.historyStripCols, base.historyStripCols ?? base.stripCols);
 
     out.set(key, {
+      imageDetail: p.imageDetail === 'high' || p.imageDetail === 'original' ? p.imageDetail : base.imageDetail,
       vision: isValidVision(p.vision) ? p.vision : base.vision,
       cacheReadRate: rate(p.cacheReadRate, base.cacheReadRate),
+      cacheWriteRate: rate(p.cacheWriteRate, base.cacheWriteRate ?? 1),
+      cacheBreakpoints: base.cacheBreakpoints,
       outputRate: rate(p.outputRate, base.outputRate),
       stripCols: posInt(p.stripCols, base.stripCols),
       maxHeightPx: posInt(p.maxHeightPx, base.maxHeightPx),

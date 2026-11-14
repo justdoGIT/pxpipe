@@ -8,6 +8,7 @@ import {
   type SessionsPaths,
 } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
+import { transformRequest } from '../src/core/transform.js';
 
 // ---- Test scaffolding ------------------------------------------------------
 
@@ -342,6 +343,83 @@ describe('aggregateSessions', () => {
     // actual = 25100; saved = 9900. No wall-clock-only warmth is credited.
     expect(s.tokensSavedEst).toBe(19_800);
   });
+
+  it('prices text warm on an image miss after a fresh same-prefix prior (L3-T0 row-35 golden)', async () => {
+    const base = {
+      compressed: true,
+      first_user_sha8: 'c4fa7142',
+      system_sha8: '8d36a7a6',
+      cache_prefix_tools_sha8: '80a31dc9',
+      model: 'claude-opus-5-5',
+      baseline_probe_status: 'ok' as const,
+    };
+    writeEvents(tmp, [
+      ev({
+        ...base,
+        ts: '2026-10-19T05:51:53.466Z',
+        duration_ms: 4248,
+        cache_prefix_sha8: '4e4c9ca6',
+        baseline_tokens: 231849,
+        baseline_cacheable_tokens: 231849,
+        input_tokens: 2,
+        output_tokens: 172,
+        cache_create_tokens: 401,
+        cache_read_tokens: 68024,
+      }),
+      ev({
+        ...base,
+        ts: '2026-10-19T05:52:01.803Z',
+        duration_ms: 7502,
+        cache_prefix_sha8: '58d9b560', // real log: pxpipe changed its prefix
+        baseline_tokens: 234521,
+        baseline_cacheable_tokens: 234521,
+        input_tokens: 2,
+        output_tokens: 193,
+        cache_create_tokens: 51613,
+        cache_read_tokens: 0,
+      }),
+    ]);
+    const { sessions } = await aggregateSessions(tmp);
+    // Row 40: 23184.9 - 7305.65 = +15879.25 (rounds to 15879).
+    // Row 41: 26524.9 - 64518.25 = -37993.35 (0.15.0 said +228,633).
+    expect(sessions.get('c4fa7142')!.tokensSavedEst).toBe(15_879 - 37_993);
+  });
+
+  it('keeps text cold on an image miss when the tools hash changed', async () => {
+    writeEvents(tmp, [
+      ev({
+        ts: '2026-05-18T00:00:00.000Z',
+        compressed: true,
+        first_user_sha8: 'eeeeeeee',
+        system_sha8: 'stable-system',
+        cache_prefix_tools_sha8: 'tools-a',
+        baseline_probe_status: 'ok',
+        baseline_tokens: 30_000,
+        baseline_cacheable_tokens: 20_000,
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_create_tokens: 0,
+        cache_read_tokens: 20_000,
+      }),
+      ev({
+        ts: '2026-05-18T00:01:00.000Z',
+        compressed: true,
+        first_user_sha8: 'eeeeeeee',
+        system_sha8: 'stable-system',
+        cache_prefix_tools_sha8: 'tools-b',
+        baseline_probe_status: 'ok',
+        baseline_tokens: 30_000,
+        baseline_cacheable_tokens: 20_000,
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_create_tokens: 20_000,
+        cache_read_tokens: 0,
+      }),
+    ]);
+    const { sessions } = await aggregateSessions(tmp);
+    // 9900 (warm via cr) + 9900 (cold: 35000 - 25100).
+    expect(sessions.get('eeeeeeee')!.tokensSavedEst).toBe(19_800);
+  });
 });
 
 // ---- filter + list ---------------------------------------------------------
@@ -426,6 +504,29 @@ describe('Claude Code session map', () => {
     expect(ref!.sessionId).toBe('abc-123');
     expect(ref!.projectPath).toBe('/Users/me/code/pxpipe');
     expect(ref!.firstUserPreview).toContain('hello');
+  });
+
+  it('matches the proxy key when the transcript opens with a CLAUDE.md reminder', async () => {
+    const root = makeCCRoot();
+    const proj = path.join(root, '-Users-me-bar');
+    fs.mkdirSync(proj, { recursive: true });
+    const reminder = '<system-reminder>\n# claudeMd\nrules\n</system-reminder>';
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: reminder }, { type: 'text', text: 'ship it' }] },
+    ];
+    fs.writeFileSync(
+      path.join(proj, 'sess-r.jsonl'),
+      [
+        JSON.stringify({ type: 'user', message: messages[0] }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'ok' } }),
+      ].join('\n') + '\n',
+    );
+    const { info } = await transformRequest(
+      new TextEncoder().encode(JSON.stringify({ model: 'claude', messages, system: 'x\n'.repeat(400) })),
+    );
+    const ref = (await claudeCodeMap(root)).get(info.firstUserSha8!);
+    expect(ref?.sessionId).toBe('sess-r');
+    expect(ref?.firstUserPreview).toContain('ship it');
   });
 
   it('parses content-array blocks (the modern Claude Code shape)', async () => {

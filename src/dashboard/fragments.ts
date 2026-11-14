@@ -77,8 +77,10 @@ export function renderToggleFragment(enabled: boolean): string {
 
 /** Chip catalog — UNION with env scope + active set, so env-var models stay toggleable. Labels are cosmetic. */
 const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
-  { id: 'claude-fable-5', label: 'Fable 5' },
+  { id: 'claude-fable-5', label: 'Fable 5 (all versions)' },
   { id: 'claude-opus-5', label: 'Opus 5' },
+  { id: 'claude-opus-5-5', label: 'Opus 5.5' },
+  { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5' },
 ];
 
 const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
@@ -87,12 +89,19 @@ const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
 ];
 
 const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'grok-4.6', label: 'Grok 4.6' },
   { id: 'grok-4.5', label: 'Grok 4.5' },
 ];
 
 const GEMINI_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
+  // `gemini` is the family base (default on): covers 3.6/3.7/3.8, Pro, 4, 5 and
+  // whatever ships next. The per-version chips are for narrowing scope after
+  // opting the family off.
+  { id: 'gemini', label: 'Gemini (all versions)' },
   { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
   { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
+  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
+  { id: 'gemini-4', label: 'Gemini 4' },
 ];
 
 export function renderModelsFragment(
@@ -152,7 +161,7 @@ export function renderModelsFragment(
     `<div class="models">` +
     `<span class="models-label">Image Gemini models</span>` +
     geminiChips +
-    `<span class="hint">enabled by default · 100/100 vision reader</span>` +
+    `<span class="hint">on by default · toggle off to opt out · 100/100 vision reader</span>` +
     `</div>` +
     `<div class="models">` +
     `<span class="models-label">Image OpenAI Responses models</span>` +
@@ -493,10 +502,10 @@ export function renderContextMapFragment(
         ['System / developer items', rc.systemDeveloper],
         ['User / assistant text kept native', rc.userAssistant],
         ['Native tool JSON', rc.toolsJson],
-        ['Function calls', rc.functionCalls],
-        ['Function outputs', rc.functionOutputs],
-        ['Function outputs eligible in old closed pairs', rc.imageableFunctionOutputs ?? 0],
-        ['Function outputs actually imaged this request', rc.collapsedFunctionOutputs ?? 0],
+        ['Tool calls (function + custom)', rc.functionCalls],
+        ['Tool outputs (function + custom)', rc.functionOutputs],
+        ['Tool outputs eligible in old closed pairs', rc.imageableFunctionOutputs ?? 0],
+        ['Tool outputs actually imaged this request', rc.collapsedFunctionOutputs ?? 0],
         ['Reasoning / encrypted items', rc.reasoningEncrypted],
         ['Compaction / opaque items', rc.compactionOpaque],
         ['Other Responses items', rc.other],

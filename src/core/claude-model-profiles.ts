@@ -84,41 +84,50 @@ export const CLAUDE_LEGACY_PROFILE: GptModelProfile = {
 };
 
 /**
- * Legible collapsed-history geometry, DEFAULT for every Claude model except
- * Fable. Measured (PR #170, 26-value exact-recall battery, ground truth
- * withheld): at the dense 312-col spleen-5x8 geometry Fable 5 read 25/26
- * exactly while Opus 5 read 3/26 with 10 SILENTLY wrong; at 172 cols
- * jetbrains-mono-14 Opus read 100/100. 172 cols at this font still fits
- * 1568x728, so nothing is downscaled. Cost on live transcript: dense is 5.28x
- * cheaper than text, legible 1.47x — still a saving, so misread-prone models
- * get legibility by default rather than behind a flag. Only history pays the
- * wider geometry: the static slab and tool-result pages hold no exact values
- * and stay dense.
+ * Spaced geometry, DEFAULT for every Claude model except the original Fable 5:
+ * the same 312-col spleen-5x8 cell with 2 px of extra row height.
+ *
+ * Opus 5.5 gist recall (eval/gist-recall, 98 answerable, image arm):
+ *
+ *   dense 5x8          84/98   2.31x cheaper than text
+ *   5x8 +2px rows      93/98   1.85x
+ *   jetbrains-mono-14  --      0.54-0.92x (costs MORE than text on this corpus)
+ *
+ * 0/16 confabulations at every geometry. Bare 5x8 glyphs are not the problem
+ * (sparse ids 99.9% per char); misses came from crowded rows. The 14px profile
+ * this replaces was legible but no longer saved tokens, so it was dropped.
  */
-const CLAUDE_HISTORY_STRIP_COLS = 172;
-const CLAUDE_HISTORY_STYLE: GptRenderStyle = {
+const CLAUDE_SPACED_STYLE: GptRenderStyle = {
   ...BASE_STYLE,
-  font: 'jetbrains-mono-14',
+  cellHBonus: 2,
 };
 
-export const CLAUDE_LEGIBLE_PROFILE: GptModelProfile = {
+export const CLAUDE_SPACED_PROFILE: GptModelProfile = {
   ...CLAUDE_PROFILE,
-  style: { ...BASE_STYLE },
-  historyStripCols: CLAUDE_HISTORY_STRIP_COLS,
-  historyStyle: { ...CLAUDE_HISTORY_STYLE },
+  style: { ...CLAUDE_SPACED_STYLE },
+  historyStyle: { ...CLAUDE_SPACED_STYLE },
 };
 
-export const CLAUDE_LEGACY_LEGIBLE_PROFILE: GptModelProfile = {
+export const CLAUDE_LEGACY_SPACED_PROFILE: GptModelProfile = {
   ...CLAUDE_LEGACY_PROFILE,
-  style: { ...BASE_STYLE },
-  historyStripCols: CLAUDE_HISTORY_STRIP_COLS,
-  historyStyle: { ...CLAUDE_HISTORY_STYLE },
+  style: { ...CLAUDE_SPACED_STYLE },
+  historyStyle: { ...CLAUDE_SPACED_STYLE },
 };
 
-/** Fable is the only Claude family measured accurate at dense geometry, so it
- *  alone keeps the 5.28x dense rendering for history. */
-export function isFableClaude(model: string): boolean {
-  return model.toLowerCase().includes('fable');
+/**
+ * True only for the original Fable 5, the one Claude release measured accurate
+ * at bare dense geometry. Its point releases are not: dense hex
+ * (eval/verbatim-15, N=15, same needles) on claude-fable-5-2 reads
+ *
+ *   dense 5x8       7/15
+ *   5x8 +2px rows  13/15   (what Fable 5 scores unspaced)
+ *
+ * so 5.1+ and any unrecognised Fable get spaced rows. `\d{1,2}(?!\d)` keeps a
+ * trailing date stamp (`claude-fable-5-20260601`) from reading as a minor.
+ */
+export function isBareDenseFable(model: string): boolean {
+  const v = /fable-(\d+)(?:-(\d{1,2})(?!\d))?/.exec(model.toLowerCase());
+  return v !== null && Number(v[1]) === 5 && Number(v[2] ?? '0') === 0;
 }
 
 /** Every id that must be priced and rendered as Claude. */
@@ -152,13 +161,11 @@ export function isPre47Claude(m: string): boolean {
 
 /** Pick the Claude profile for an id. Billing geometry is identical across
  *  opus/sonnet/haiku/fable; HISTORY geometry is not, because verbatim recall
- *  at dense geometry is a per-model property (see CLAUDE_LEGIBLE_PROFILE).
- *  Fable keeps dense history; every other Claude id gets legible history by
- *  default. Unmeasured families (sonnet/haiku) get legible too: a misread is
- *  silent, an extra 0.68x-of-text render cost is not. */
+ *  at dense geometry is a per-model property (see CLAUDE_SPACED_PROFILE).
+ *  Fable 5 keeps bare dense; every other Claude id gets spaced rows. */
 export function resolveClaudeProfile(m: string): GptModelProfile {
-  if (isFableClaude(m)) {
+  if (isBareDenseFable(m)) {
     return isPre47Claude(m) ? CLAUDE_LEGACY_PROFILE : CLAUDE_PROFILE;
   }
-  return isPre47Claude(m) ? CLAUDE_LEGACY_LEGIBLE_PROFILE : CLAUDE_LEGIBLE_PROFILE;
+  return isPre47Claude(m) ? CLAUDE_LEGACY_SPACED_PROFILE : CLAUDE_SPACED_PROFILE;
 }
